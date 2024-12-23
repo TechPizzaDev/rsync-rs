@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::io::Read;
 
 use arrayref::array_ref;
+use futures::io::AllowStdIo;
+use futures::{AsyncRead, AsyncReadExt};
 
 use crate::consts::{BLAKE2_MAGIC, MD4_MAGIC};
 use crate::crc::Crc;
@@ -86,47 +89,85 @@ pub struct SignatureOptions {
 impl Signature {
     const HEADER_SIZE: usize = SignatureType::SIZE + 2 * 4; // magic, block_size, then crypto_hash_size
 
-    /// Compute an MD4 signature for the given data.
+    /// Compute a signature for the given data.
     ///
-    /// `options.block_size` must be greater than zero. `options.crypto_hash_size` must be at most 16, the length of an MD4 hash.
+    /// `options.block_size` must be greater than zero.  
+    /// `options.crypto_hash_size` must be at most 16, the length of an MD4 hash.  
     /// Panics if the provided options are invalid.
-    pub fn calculate(buf: &[u8], options: SignatureOptions) -> Signature {
+    pub fn calculate<R: Read>(
+        input: R,
+        options: SignatureOptions,
+    ) -> Result<Signature, Box<dyn std::error::Error>> {
+        futures::executor::block_on(Self::calculate_async(AllowStdIo::new(input), options))
+    }
+
+    /// Compute a signature for the given data.
+    ///
+    /// See [`calculate`].
+    /// 
+    /// [`calculate`]: Self::calculate
+    pub async fn calculate_async<R: AsyncRead + Unpin>(
+        mut input: R,
+        options: SignatureOptions,
+    ) -> Result<Signature, Box<dyn std::error::Error>> {
         assert!(options.block_size > 0);
         assert!(options.crypto_hash_size <= MD4_SIZE as u32);
-        let num_blocks = buf.chunks(options.block_size as usize).len();
+
+        let block_size = options.block_size as usize;
+        let hash_size = options.crypto_hash_size as usize;
 
         let signature_type = SignatureType::Md4;
+        let frame_size = Crc::SIZE + hash_size;
 
-        let mut signature = Vec::with_capacity(
-            Self::HEADER_SIZE + num_blocks * (Crc::SIZE + options.crypto_hash_size as usize),
-        );
-
+        let mut signature = Vec::with_capacity(Self::HEADER_SIZE);
         signature.extend_from_slice(&signature_type.to_magic());
         signature.extend_from_slice(&options.block_size.to_be_bytes());
         signature.extend_from_slice(&options.crypto_hash_size.to_be_bytes());
 
         // Hash all the blocks (with the CRC as well as MD4)
-        let chunks = buf.chunks_exact(options.block_size as usize);
-        let remainder = chunks.remainder();
-        for (block, md4_hash) in md4_many(chunks).chain(if remainder.is_empty() {
-            None
-        } else {
+
+        let buf_cap = block_size.clamp(1024, 1024 * 16);
+        let mut buf = Vec::with_capacity(buf_cap);
+        loop {
+            // Buffer at most one block if it's larger than `buf_cap`.
+            let limit = (buf_cap.max(block_size) - buf.len()) as u64;
+            let n = (&mut input).take(limit).read_to_end(&mut buf).await?;
+
+            let blocks = buf.chunks_exact(block_size);
+            let blocks_exact_len = blocks.len() * block_size;
+            signature.reserve(blocks.len() * frame_size);
+
+            for (block, md4_hash) in md4_many(blocks) {
+                let hash = &md4_hash[..hash_size];
+                write_frame(&mut signature, block, hash);
+            }
+
+            buf.drain(0..blocks_exact_len);
+            if n == 0 {
+                break;
+            }
+        }
+        debug_assert!(buf.len() < block_size);
+
+        if !buf.is_empty() {
             // Manually tack on the last block if necessary, since `md4_many`
             // requires every block to be identical in size
-            Some((remainder, md4(remainder)))
-        }) {
-            // would be nice to use `chunks_exact_mut`, but it doesn't work for zero sizes
-            let crc = Crc::new().update(block);
-            let crypto_hash = &md4_hash[..options.crypto_hash_size as usize];
-            signature.extend_from_slice(&crc.to_bytes());
-            signature.extend_from_slice(crypto_hash);
+            let hash = &md4(&buf)[..hash_size];
+            write_frame(&mut signature, &buf, hash);
         }
-        Signature {
-            signature_type: SignatureType::Md4,
+
+        fn write_frame(signature: &mut Vec<u8>, block: &[u8], hash: &[u8]) {
+            let crc = Crc::new().update(block);
+            signature.extend_from_slice(&crc.to_bytes());
+            signature.extend_from_slice(hash);
+        }
+
+        Ok(Signature {
+            signature_type,
             block_size: options.block_size,
             crypto_hash_size: options.crypto_hash_size,
             signature,
-        }
+        })
     }
 
     /// Read a binary signature.
@@ -176,6 +217,7 @@ impl Signature {
         let blocks = self.blocks();
         let mut block_index: HashMap<Crc, SecondLayerMap<&[u8], u32>, BuildCrcHasher> =
             HashMap::with_capacity_and_hasher(blocks.len(), BuildCrcHasher::default());
+            
         for (idx, (crc, crypto_hash)) in blocks.enumerate() {
             block_index
                 .entry(crc)

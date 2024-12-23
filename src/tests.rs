@@ -6,12 +6,13 @@ use crate::{apply, diff, Signature, SignatureOptions};
 #[quickcheck]
 fn test_signature_creation(data: Vec<u8>, block_size: u32, crypto_hash_size: u32) {
     let signature = Signature::calculate(
-        &data,
+        data.as_slice(),
         SignatureOptions {
             block_size: block_size.saturating_add(1),
             crypto_hash_size: crypto_hash_size % 16,
         },
-    );
+    )
+    .unwrap();
     let serialized = signature.serialized().to_vec();
     let deserialized = Signature::deserialize(serialized).expect("deserialization error");
     assert_eq!(signature, deserialized);
@@ -21,12 +22,13 @@ fn test_signature_creation(data: Vec<u8>, block_size: u32, crypto_hash_size: u32
 fn test_trivial() {
     let data = vec![0; 100000];
     let signature = Signature::calculate(
-        &data,
+        data.as_slice(),
         SignatureOptions {
             block_size: 64,
             crypto_hash_size: 5,
         },
-    );
+    )
+    .unwrap();
     let indexed = signature.index();
     let mut patch = vec![];
     diff(&indexed, &data, &mut patch).expect("diff error");
@@ -44,12 +46,13 @@ fn test_delta_size() {
     data2.resize(1 << 20, 0);
 
     let signature = Signature::calculate(
-        &data1,
+        &mut data1.as_slice(),
         SignatureOptions {
             block_size: 4096,
             crypto_hash_size: 8,
         },
-    );
+    )
+    .unwrap();
     let mut patch = vec![];
     diff(&signature.index(), &data2, &mut patch).expect("diff error");
     let mut out = vec![];
@@ -66,12 +69,13 @@ fn test_random() {
     let mut data = vec![0; 100000];
     rand::thread_rng().fill(&mut data[..]);
     let signature = Signature::calculate(
-        &base,
+        base.as_slice(),
         SignatureOptions {
             block_size: 4,
             crypto_hash_size: 8,
         },
-    );
+    )
+    .unwrap();
     let indexed = signature.index();
     let mut patch = vec![];
     diff(&indexed, &data, &mut patch).expect("diff error");
@@ -117,12 +121,13 @@ fn test_signature_interoperability() {
                 )
                 .unwrap();
                 let signature = Signature::calculate(
-                    &data,
+                    data.as_slice(),
                     SignatureOptions {
                         block_size: block_len as u32,
                         crypto_hash_size: strong_len as u32,
                     },
-                );
+                )
+                .unwrap();
                 let serialized = signature.into_serialized();
                 assert_eq!(
                     librsync_out, serialized,

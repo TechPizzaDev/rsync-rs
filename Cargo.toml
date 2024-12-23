@@ -11,12 +11,12 @@ edition = "2018"
 
 exclude = [
     ".github",
-    ".gitignore",
-    "rust-toolchain",
+    ".gitignore"
 ]
 
 [dependencies]
 arrayref = "0.3.6"
+futures = "0.3"
 
 [dev-dependencies]
 librsync = { git = "https://github.com/goffrie/librsync-rs", rev = "e2e4b06022d889e020c439f2dc92ea2fec0e483e", default-features = false }

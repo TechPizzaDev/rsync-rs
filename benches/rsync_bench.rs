@@ -48,12 +48,13 @@ fn calculate_signature(c: &mut Criterion) {
         |b, data| {
             b.iter(|| {
                 Signature::calculate(
-                    black_box(data),
+                    black_box(data.as_slice()),
                     SignatureOptions {
                         block_size: 4096,
                         crypto_hash_size: 8,
                     },
                 )
+                .unwrap()
                 .into_serialized();
             })
         },
@@ -93,6 +94,7 @@ fn bench_diff(
             crypto_hash_size: 8,
         },
     )
+    .unwrap()
     .into_serialized();
     let mut group = c.benchmark_group(name);
     group.sample_size(15);
@@ -159,12 +161,13 @@ fn apply_delta(c: &mut Criterion) {
     let mut delta = Vec::new();
     diff(
         &Signature::calculate(
-            &data,
+            data.as_slice(),
             SignatureOptions {
                 block_size: 4096,
                 crypto_hash_size: 8,
             },
         )
+        .unwrap()
         .index(),
         &new_data,
         &mut delta,
