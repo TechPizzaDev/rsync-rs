@@ -1,17 +1,18 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::io::Read;
+use std::io::Write;
 
 use arrayref::array_ref;
-use futures::io::AllowStdIo;
-use futures::{AsyncRead, AsyncReadExt};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::consts::{BLAKE2_MAGIC, MD4_MAGIC};
 use crate::crc::Crc;
 use crate::hasher::BuildCrcHasher;
 use crate::hashmap_variant::SecondLayerMap;
-use crate::md4::{md4, md4_many, MD4_SIZE};
+use crate::md4::{md4, md4_many};
+use crate::{consts::*, CryptoHashType, RollingHashType};
+
+type IoError = std::io::Error;
 
 /// An rsync signature.
 ///
@@ -19,18 +20,17 @@ use crate::md4::{md4, md4_many, MD4_SIZE};
 /// against that data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Signature {
-    signature_type: SignatureType,
+    crypto_hash: CryptoHashType,
+    rolling_hash: RollingHashType,
     block_size: u32,
     crypto_hash_size: u32,
-    // This contains a valid serialized signature which must contain the correct magic for `signature_type`
-    // and a matching `block_size` and `crypto_hash_size`.
-    signature: Vec<u8>,
 }
 
 /// A signature with a block index, suitable for calculating deltas.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedSignature<'a> {
-    pub(crate) signature_type: SignatureType,
+    pub(crate) crypto_hash: CryptoHashType,
+    pub(crate) rolling_hash: RollingHashType,
     pub(crate) block_size: u32,
     pub(crate) crypto_hash_size: u32,
     /// crc -> crypto hash -> block index
@@ -40,32 +40,89 @@ pub struct IndexedSignature<'a> {
 /// The hash type used with within the signature.
 /// Note that this library generally only supports MD4 signatures.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SignatureType {
+pub enum SignatureType {
+    ///
     Md4,
+    ///
     Blake2,
+    ///
+    RabinKarpMd4,
+    ///
+    RabinKarpBlake2,
 }
 
 impl SignatureType {
-    const SIZE: usize = 4;
-    fn from_magic(bytes: [u8; Self::SIZE]) -> Option<Self> {
-        match u32::from_be_bytes(bytes) {
-            BLAKE2_MAGIC => Some(SignatureType::Blake2),
-            MD4_MAGIC => Some(SignatureType::Md4),
-            _ => None,
-        }
+    const SIZE: usize = size_of::<u32>();
+
+    ///
+    pub fn from_types(crypto: CryptoHashType, rolling: RollingHashType) -> Option<SignatureType> {
+        let sig_type = match (crypto, rolling) {
+            (CryptoHashType::Md4, RollingHashType::Adler32) => Self::Md4,
+            (CryptoHashType::Md4, RollingHashType::RabinKarp) => Self::Md4,
+            (CryptoHashType::Blake2, RollingHashType::Adler32) => Self::Blake2,
+            (CryptoHashType::Blake2, RollingHashType::RabinKarp) => Self::Blake2,
+            _ => return None,
+        };
+        Some(sig_type)
     }
-    fn to_magic(self) -> [u8; Self::SIZE] {
+
+    ///
+    pub fn from_magic(bytes: [u8; Self::SIZE]) -> Result<Self, u32> {
+        let magic = u32::from_be_bytes(bytes);
+        let sig_type = match magic {
+            BLAKE2_MAGIC => Self::Blake2,
+            MD4_MAGIC => Self::Md4,
+            RK_BLAKE2_MAGIC => Self::RabinKarpBlake2,
+            RK_MD4_MAGIC => Self::RabinKarpMd4,
+            _ => return Err(magic),
+        };
+        Ok(sig_type)
+    }
+
+    ///
+    pub fn to_magic(&self) -> [u8; Self::SIZE] {
         match self {
-            SignatureType::Md4 => MD4_MAGIC,
-            SignatureType::Blake2 => BLAKE2_MAGIC,
+            Self::Md4 => MD4_MAGIC,
+            Self::Blake2 => BLAKE2_MAGIC,
+            Self::RabinKarpMd4 => RK_MD4_MAGIC,
+            Self::RabinKarpBlake2 => RK_BLAKE2_MAGIC,
         }
         .to_be_bytes()
+    }
+
+    ///
+    pub fn crypto_hash(&self) -> CryptoHashType {
+        match self {
+            Self::Md4 => CryptoHashType::Md4,
+            Self::Blake2 => CryptoHashType::Blake2,
+            Self::RabinKarpMd4 => CryptoHashType::Md4,
+            Self::RabinKarpBlake2 => CryptoHashType::Blake2,
+        }
+    }
+
+    ///
+    pub fn rolling_hash(&self) -> RollingHashType {
+        match self {
+            Self::Md4 => RollingHashType::Adler32,
+            Self::Blake2 => RollingHashType::Adler32,
+            Self::RabinKarpMd4 => RollingHashType::RabinKarp,
+            Self::RabinKarpBlake2 => RollingHashType::RabinKarp,
+        }
     }
 }
 
 /// Indicates that a signature was not valid.
 #[derive(Debug)]
-pub struct SignatureParseError(());
+pub enum SignatureParseError {
+    ///
+    IoError(IoError),
+
+    /// The signature started with an unknown magic.
+    UnknownMagic {
+        /// The magic number encountered.
+        magic: u32,
+    },
+}
 
 impl fmt::Display for SignatureParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -75,71 +132,100 @@ impl fmt::Display for SignatureParseError {
 
 impl Error for SignatureParseError {}
 
+impl From<IoError> for SignatureParseError {
+    fn from(value: IoError) -> Self {
+        Self::IoError(value)
+    }
+}
+
 /// Options for [Signature::calculate].
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignatureOptions {
+    ///
+    pub crypto_hash: CryptoHashType,
+
+    ///
+    pub rolling_hash: RollingHashType,
+
     /// The granularity of the signature.
     /// Smaller block sizes yield larger, but more precise, signatures.
     pub block_size: u32,
-    /// The number of bytes to use from the MD4 hash. Must be at most 16.
+
+    /// The number of bytes to use from the hash.
     /// The larger this is, the less likely that a delta will be mis-applied.
     pub crypto_hash_size: u32,
+}
+
+impl SignatureOptions {
+    ///
+    pub fn signature_type(&self) -> Option<SignatureType> {
+        SignatureType::from_types(self.crypto_hash, self.rolling_hash)
+    }
+
+    /// Attempts to write an `librsync` header,
+    /// returning `true` when the magic is compatible.
+    ///
+    /// Hashes not supported by `librsync` are written as magic `0x00_00_00_00`.
+    pub fn write_header<W: Write>(&self, mut output: W) -> Result<bool, IoError> {
+        let magic = self.signature_type().map(|s| s.to_magic());
+        let magic_bytes = magic.unwrap_or([0u8; SignatureType::SIZE]);
+
+        output.write_all(&magic_bytes)?;
+        output.write_all(&self.block_size.to_be_bytes())?;
+        output.write_all(&self.crypto_hash_size.to_be_bytes())?;
+
+        Ok(magic.is_some())
+    }
 }
 
 impl Signature {
     const HEADER_SIZE: usize = SignatureType::SIZE + 2 * 4; // magic, block_size, then crypto_hash_size
 
     /// Compute a signature for the given data.
-    ///
-    /// `options.block_size` must be greater than zero.  
-    /// `options.crypto_hash_size` must be at most 16, the length of an MD4 hash.  
+    //
     /// Panics if the provided options are invalid.
-    pub fn calculate<R: Read>(
-        input: R,
-        options: SignatureOptions,
-    ) -> Result<Signature, Box<dyn std::error::Error>> {
-        futures::executor::block_on(Self::calculate_async(AllowStdIo::new(input), options))
-    }
-
-    /// Compute a signature for the given data.
-    ///
-    /// See [`calculate`].
-    /// 
-    /// [`calculate`]: Self::calculate
-    pub async fn calculate_async<R: AsyncRead + Unpin>(
-        mut input: R,
-        options: SignatureOptions,
-    ) -> Result<Signature, Box<dyn std::error::Error>> {
-        assert!(options.block_size > 0);
-        assert!(options.crypto_hash_size <= MD4_SIZE as u32);
-
+    pub async fn calculate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        input: &mut R,
+        output: &mut W,
+        options: &SignatureOptions,
+    ) -> Result<Signature, IoError> {
         let block_size = options.block_size as usize;
         let hash_size = options.crypto_hash_size as usize;
+        let crypto_hash = options.crypto_hash;
+        let rolling_hash = options.rolling_hash;
 
-        let signature_type = SignatureType::Md4;
-        let frame_size = Crc::SIZE + hash_size;
+        assert!(block_size > 0);
+        assert!(hash_size <= crypto_hash.sum_len());
 
-        let mut signature = Vec::with_capacity(Self::HEADER_SIZE);
-        signature.extend_from_slice(&signature_type.to_magic());
-        signature.extend_from_slice(&options.block_size.to_be_bytes());
-        signature.extend_from_slice(&options.crypto_hash_size.to_be_bytes());
+        let mut header_buf = Vec::with_capacity(Self::HEADER_SIZE);
+        options.write_header(&mut header_buf)?;
+        output.write_all(&header_buf).await?;
 
-        // Hash all the blocks (with the CRC as well as MD4)
-
+        // Hash all the blocks with buffering.
         let buf_cap = block_size.clamp(1024, 1024 * 16);
         let mut buf = Vec::with_capacity(buf_cap);
         loop {
             // Buffer at most one block if it's larger than `buf_cap`.
             let limit = (buf_cap.max(block_size) - buf.len()) as u64;
-            let n = (&mut input).take(limit).read_to_end(&mut buf).await?;
+            let n = input.take(limit).read_to_end(&mut buf).await?;
 
             let blocks = buf.chunks_exact(block_size);
             let blocks_exact_len = blocks.len() * block_size;
-            signature.reserve(blocks.len() * frame_size);
 
-            for (block, md4_hash) in md4_many(blocks) {
-                let hash = &md4_hash[..hash_size];
-                write_frame(&mut signature, block, hash);
+            match crypto_hash {
+                CryptoHashType::Md4 => {
+                    for (block, md4_hash) in md4_many(blocks) {
+                        let hash = &md4_hash[..hash_size];
+                        write_block(output, rolling_hash, block, hash).await?;
+                    }
+                }
+                CryptoHashType::Blake2 => {
+                    for block in blocks {
+                        let hash = &blake_hash(block)[..hash_size];
+                        write_block(output, rolling_hash, block, hash).await?;
+                    }
+                }
+                _ => unimplemented!(),
             }
 
             buf.drain(0..blocks_exact_len);
@@ -152,58 +238,82 @@ impl Signature {
         if !buf.is_empty() {
             // Manually tack on the last block if necessary, since `md4_many`
             // requires every block to be identical in size
-            let hash = &md4(&buf)[..hash_size];
-            write_frame(&mut signature, &buf, hash);
+            match crypto_hash {
+                CryptoHashType::Md4 => {
+                    let hash = &md4(&buf)[..hash_size];
+                    write_block(output, rolling_hash, &buf, hash).await?;
+                }
+                CryptoHashType::Blake2 => {
+                    let hash = &blake_hash(&buf)[..hash_size];
+                    write_block(output, rolling_hash, &buf, hash).await?;
+                }
+                _ => unimplemented!(),
+            }
         }
 
-        fn write_frame(signature: &mut Vec<u8>, block: &[u8], hash: &[u8]) {
+        fn blake_hash(block: &[u8]) -> [u8; MAX_STRONG_SUM_LENGTH as usize] {
+            blake2b_simd::Params::new()
+                .hash_length(MAX_STRONG_SUM_LENGTH as usize)
+                .hash(block)
+                .as_bytes()
+                .try_into()
+                .unwrap()
+        }
+
+        async fn write_block<W: AsyncWrite + Unpin>(
+            output: &mut W,
+            rolling_hash: RollingHashType,
+            block: &[u8],
+            hash: &[u8],
+        ) -> Result<(), IoError> {
+            if rolling_hash != RollingHashType::Adler32 {
+                unimplemented!();
+            }
+
             let crc = Crc::new().update(block);
-            signature.extend_from_slice(&crc.to_bytes());
-            signature.extend_from_slice(hash);
+            output.write_all(&crc.to_bytes()).await?;
+            output.write_all(hash).await?;
+            Ok(())
         }
 
         Ok(Signature {
-            signature_type,
-            block_size: options.block_size,
-            crypto_hash_size: options.crypto_hash_size,
-            signature,
+            crypto_hash,
+            rolling_hash,
+            block_size: block_size as u32,
+            crypto_hash_size: hash_size as u32,
         })
     }
 
     /// Read a binary signature.
-    pub fn deserialize(signature: Vec<u8>) -> Result<Signature, SignatureParseError> {
-        if signature.len() < Self::HEADER_SIZE {
-            return Err(SignatureParseError(()));
-        }
-        let signature_type = SignatureType::from_magic(*array_ref![signature, 0, 4])
-            .ok_or(SignatureParseError(()))?;
-        let block_size = u32::from_be_bytes(*array_ref![signature, 4, 4]);
-        let crypto_hash_size = u32::from_be_bytes(*array_ref![signature, 8, 4]);
-        let block_signature_size = Crc::SIZE + crypto_hash_size as usize;
-        if (signature.len() - Self::HEADER_SIZE) % block_signature_size != 0 {
-            return Err(SignatureParseError(()));
-        }
+    pub async fn deserialize<R: AsyncRead + Unpin>(
+        input: &mut R,
+    ) -> Result<Signature, SignatureParseError> {
+        let mut header_buf = [0; Self::HEADER_SIZE];
+        input.read_exact(&mut header_buf).await?;
+
+        let signature_type = SignatureType::from_magic(*array_ref![header_buf, 0, 4])
+            .map_err(|magic| SignatureParseError::UnknownMagic { magic })?;
+
+        let block_size = u32::from_be_bytes(*array_ref![header_buf, 4, 4]);
+        let crypto_hash_size = u32::from_be_bytes(*array_ref![header_buf, 8, 4]);
+
+        // TODO: verify len per block elsewhere?
+        //let block_signature_size = Crc::SIZE + crypto_hash_size as usize;
+        //if (blocks.len() - Self::HEADER_SIZE) % block_signature_size != 0 {
+        //    return Err(SignatureParseError::IncompleteBlock);
+        //}
+
         Ok(Signature {
-            signature_type,
+            crypto_hash: signature_type.crypto_hash(),
+            rolling_hash: signature_type.rolling_hash(),
             block_size,
             crypto_hash_size,
-            signature,
         })
     }
 
-    /// Get the serialized form of this signature.
-    pub fn serialized(&self) -> &[u8] {
-        &self.signature
-    }
-
-    /// Get ownership of the serialized form of this signature.
-    pub fn into_serialized(self) -> Vec<u8> {
-        self.signature
-    }
-
-    fn blocks(&self) -> impl ExactSizeIterator<Item = (Crc, &[u8])> {
-        self.signature[Self::HEADER_SIZE..]
-            .chunks(Crc::SIZE + self.crypto_hash_size as usize)
+    fn blocks<'a>(&self, bytes: &'a [u8]) -> impl ExactSizeIterator<Item = (Crc, &'a [u8])> {
+        bytes[Self::HEADER_SIZE..]
+            .chunks_exact(Crc::SIZE + self.crypto_hash_size as usize)
             .map(|b| {
                 (
                     Crc::from_bytes(*array_ref!(b, 0, Crc::SIZE)),
@@ -213,11 +323,33 @@ impl Signature {
     }
 
     /// Convert a signature to a form suitable for computing deltas.
-    pub fn index(&self) -> IndexedSignature<'_> {
-        let blocks = self.blocks();
+    pub fn index<'a>(&self, bytes: &'a [u8]) -> IndexedSignature<'a> {
+        let blocks = self.blocks(bytes);
+        IndexedSignature::new(
+            blocks,
+            &SignatureOptions {
+                crypto_hash: self.crypto_hash,
+                rolling_hash: self.rolling_hash,
+                block_size: self.block_size,
+                crypto_hash_size: self.crypto_hash_size,
+            },
+        )
+    }
+}
+
+impl<'a> IndexedSignature<'a> {
+    ///
+    pub fn new(
+        blocks: impl ExactSizeIterator<Item = (Crc, &'a [u8])>,
+        options: &SignatureOptions,
+    ) -> IndexedSignature<'a> {
+        if options.rolling_hash != RollingHashType::Adler32 {
+            unimplemented!();
+        }
+
         let mut block_index: HashMap<Crc, SecondLayerMap<&[u8], u32>, BuildCrcHasher> =
             HashMap::with_capacity_and_hasher(blocks.len(), BuildCrcHasher::default());
-            
+
         for (idx, (crc, crypto_hash)) in blocks.enumerate() {
             block_index
                 .entry(crc)
@@ -231,9 +363,10 @@ impl Signature {
         block_index.shrink_to_fit();
 
         IndexedSignature {
-            signature_type: self.signature_type,
-            block_size: self.block_size,
-            crypto_hash_size: self.crypto_hash_size,
+            crypto_hash: options.crypto_hash,
+            rolling_hash: options.rolling_hash,
+            block_size: options.block_size,
+            crypto_hash_size: options.crypto_hash_size,
             blocks: block_index,
         }
     }

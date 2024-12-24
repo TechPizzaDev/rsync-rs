@@ -9,8 +9,9 @@ use crate::consts::{
 };
 use crate::crc::Crc;
 use crate::hasher::BuildCrcHasher;
-use crate::md4::{md4, MD4_SIZE};
-use crate::signature::{IndexedSignature, SignatureType};
+use crate::md4::md4;
+use crate::signature::IndexedSignature;
+use crate::{CryptoHashType, RollingHashType};
 
 /// This controls how many times we will allow ourselves to fail at matching a
 /// given crc before permanently giving up on it (essentially removing it from
@@ -167,13 +168,16 @@ pub fn diff(
 ) -> Result<(), DiffError> {
     let block_size = signature.block_size;
     let crypto_hash_size = signature.crypto_hash_size as usize;
-    if let SignatureType::Md4 = signature.signature_type {
-        if crypto_hash_size > MD4_SIZE {
-            return Err(DiffError::InvalidSignature);
-        }
-    } else {
+    if crypto_hash_size > signature.crypto_hash.sum_len() {
         return Err(DiffError::InvalidSignature);
     }
+
+    if (signature.crypto_hash, signature.rolling_hash)
+        != (CryptoHashType::Md4, RollingHashType::Adler32)
+    {
+        unimplemented!();
+    }
+
     out.write_all(&DELTA_MAGIC.to_be_bytes())?;
     let mut state = OutputState {
         emitted: 0,
@@ -182,6 +186,7 @@ pub fn diff(
     let mut here = 0;
     let mut collisions: HashMap<Crc, u32, BuildCrcHasher> =
         HashMap::with_hasher(BuildCrcHasher::default());
+
     while data.len() - here >= block_size as usize {
         let mut crc = Crc::new().update(&data[here..here + block_size as usize]);
         loop {

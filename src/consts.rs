@@ -1,6 +1,14 @@
 pub const MD4_MAGIC: u32 = 0x72730136;
 pub const BLAKE2_MAGIC: u32 = 0x72730137;
+pub const RK_MD4_MAGIC: u32 = 0x72730146;
+pub const RK_BLAKE2_MAGIC: u32 = 0x72730147;
 pub const DELTA_MAGIC: u32 = 0x72730236;
+
+pub const MD4_SUM_LENGTH: u32 = 16;
+pub const BLAKE2_SUM_LENGTH: u32 = 32;
+pub const BLAKE3_SUM_LENGTH: u32 = 32;
+
+pub const MAX_STRONG_SUM_LENGTH: u32 = 32;
 
 pub const RS_OP_END: u8 = 0;
 

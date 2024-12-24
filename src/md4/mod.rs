@@ -9,8 +9,6 @@ mod aarch64_simd_transpose;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86_simd_transpose;
 
-pub const MD4_SIZE: usize = 16;
-
 // initial values for Md4State
 const S: [u32; 4] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
 

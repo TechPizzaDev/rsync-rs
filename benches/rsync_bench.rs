@@ -8,8 +8,11 @@ mod crc;
 
 use crate::crc::Crc;
 use criterion::{black_box, BenchmarkId, Criterion, Throughput};
-use fast_rsync::{apply_limited, diff, Signature, SignatureOptions};
+use fast_rsync::{
+    apply_limited, diff, CryptoHashType, RollingHashType, Signature, SignatureOptions,
+};
 use std::io;
+use tokio::runtime::Builder;
 
 fn random_block(len: usize) -> Vec<u8> {
     use rand::RngCore;
@@ -38,6 +41,7 @@ fn crc_update(c: &mut Criterion) {
 criterion_group!(crc, crc_update);
 
 fn calculate_signature(c: &mut Criterion) {
+    let rt = Builder::new_current_thread().build().unwrap();
     let data = random_block(1 << 22);
     let mut group = c.benchmark_group("calculate_signature");
     group.throughput(Throughput::Bytes(data.len() as u64));
@@ -46,16 +50,20 @@ fn calculate_signature(c: &mut Criterion) {
         BenchmarkId::new("fast_rsync::Signature::calculate", data.len()),
         &data,
         |b, data| {
-            b.iter(|| {
+            b.to_async(&rt).iter(|| async {
+                let mut sig_output = Vec::new();
                 Signature::calculate(
-                    black_box(data.as_slice()),
-                    SignatureOptions {
+                    black_box(&mut &data[..]),
+                    &mut sig_output,
+                    &SignatureOptions {
                         block_size: 4096,
                         crypto_hash_size: 8,
+                        crypto_hash: CryptoHashType::Md4,
+                        rolling_hash: RollingHashType::Adler32,
                     },
                 )
-                .unwrap()
-                .into_serialized();
+                .await
+                .unwrap();
             })
         },
     );
@@ -87,24 +95,32 @@ fn bench_diff(
     new_data: &Vec<u8>,
     allow_librsync: bool,
 ) {
-    let signature = Signature::calculate(
-        data,
-        SignatureOptions {
-            block_size: 4096,
-            crypto_hash_size: 8,
-        },
-    )
-    .unwrap()
-    .into_serialized();
+    let rt = Builder::new_current_thread().build().unwrap();
+    let mut sig_output = Vec::new();
+    rt.block_on(async {
+        Signature::calculate(
+            &mut &data[..],
+            &mut sig_output,
+            &SignatureOptions {
+                block_size: 4096,
+                crypto_hash_size: 8,
+                crypto_hash: CryptoHashType::Md4,
+                rolling_hash: RollingHashType::Adler32,
+            },
+        )
+        .await
+        .unwrap()
+    });
+
     let mut group = c.benchmark_group(name);
     group.sample_size(15);
     group.bench_with_input(
         BenchmarkId::new("fast_rsync::diff", new_data.len()),
         new_data,
         |b, new_data| {
-            b.iter(|| {
-                let sig = Signature::deserialize(signature.clone()).unwrap();
-                let sig = sig.index();
+            b.to_async(&rt).iter(|| async {
+                let sig = Signature::deserialize(&mut &sig_output[..]).await.unwrap();
+                let sig = sig.index(&sig_output);
                 let mut out = Vec::new();
                 diff(&sig, black_box(new_data), &mut out).unwrap();
                 out
@@ -120,7 +136,7 @@ fn bench_diff(
                     let mut out = Vec::new();
                     librsync::whole::delta(
                         &mut black_box(&new_data[..]),
-                        &mut &signature[..],
+                        &mut &sig_output[..],
                         &mut out,
                     )
                     .unwrap();
@@ -155,24 +171,28 @@ fn calculate_diff(c: &mut Criterion) {
 }
 
 fn apply_delta(c: &mut Criterion) {
+    let rt = Builder::new_current_thread().build().unwrap();
     let data = random_block(1 << 22);
     let mut new_data = data.clone();
     new_data[1000000..1065536].copy_from_slice(&random_block(65536));
     let mut delta = Vec::new();
-    diff(
-        &Signature::calculate(
-            data.as_slice(),
-            SignatureOptions {
+    let mut sig_output = Vec::new();
+    let signature = rt.block_on(async {
+        Signature::calculate(
+            &mut &data[..],
+            &mut sig_output,
+            &SignatureOptions {
                 block_size: 4096,
                 crypto_hash_size: 8,
+                crypto_hash: CryptoHashType::Md4,
+                rolling_hash: RollingHashType::Adler32,
             },
         )
+        .await
         .unwrap()
-        .index(),
-        &new_data,
-        &mut delta,
-    )
-    .unwrap();
+    });
+    diff(&signature.index(&sig_output), &new_data, &mut delta).unwrap();
+
     let mut group = c.benchmark_group("apply");
     group.bench_with_input(
         BenchmarkId::new("fast_rsync::apply", new_data.len()),

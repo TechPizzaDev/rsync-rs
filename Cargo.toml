@@ -7,7 +7,7 @@ description = "An optimized implementation of librsync in pure Rust."
 readme = "README.md"
 repository = "https://github.com/dropbox/fast_rsync"
 keywords = ["rsync"]
-edition = "2018"
+edition = "2021"
 
 exclude = [
     ".github",
@@ -15,15 +15,18 @@ exclude = [
 ]
 
 [dependencies]
-arrayref = "0.3.6"
+arrayref = "0.3"
 futures = "0.3"
+blake2b_simd = "1.0"
 
 [dev-dependencies]
 librsync = { git = "https://github.com/goffrie/librsync-rs", rev = "e2e4b06022d889e020c439f2dc92ea2fec0e483e", default-features = false }
 quickcheck = { version = "1.0", default-features = false }
 quickcheck_macros = "1.0"
+quickcheck_async = "0.1"
 rand = "0.8"
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.5", default-features = false, features = ["async_tokio"]}
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [[bench]]
 name = "rsync_bench"

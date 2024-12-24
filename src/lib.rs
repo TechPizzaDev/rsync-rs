@@ -21,10 +21,14 @@ mod hashmap_variant;
 mod md4;
 mod patch;
 mod signature;
+mod types;
 
 #[cfg(test)]
 mod tests;
 
 pub use diff::{diff, DiffError};
 pub use patch::{apply, apply_limited, ApplyError};
-pub use signature::{IndexedSignature, Signature, SignatureOptions, SignatureParseError};
+pub use signature::{
+    IndexedSignature, Signature, SignatureOptions, SignatureParseError, SignatureType,
+};
+pub use types::{CryptoHashType, RollingHashType};
