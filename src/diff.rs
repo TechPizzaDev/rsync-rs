@@ -170,28 +170,41 @@ pub fn diff(
 ) -> Result<(), DiffError> {
     match (signature.rolling_hash, signature.crypto_hash) {
         (RollingHashType::Rollsum, CryptoHashType::Md4) => {
-            diff_core::<_, Md4Hash>(Crc::default(), signature, data, out)
+            diff_core(Crc::default(), Md4Hash::default(), signature, data, out)
         }
         (RollingHashType::Rollsum, CryptoHashType::Blake2) => {
-            diff_core::<_, Blake2Hash>(Crc::default(), signature, data, out)
+            diff_core(Crc::default(), Blake2Hash::default(), signature, data, out)
         }
         (RollingHashType::Rollsum, CryptoHashType::Blake3) => {
-            diff_core::<_, Blake3Hash>(Crc::default(), signature, data, out)
+            diff_core(Crc::default(), Blake3Hash::default(), signature, data, out)
         }
-        (RollingHashType::RabinKarp, CryptoHashType::Md4) => {
-            diff_core::<_, Md4Hash>(RabinKarpHash::default(), signature, data, out)
-        }
-        (RollingHashType::RabinKarp, CryptoHashType::Blake2) => {
-            diff_core::<_, Blake2Hash>(RabinKarpHash::default(), signature, data, out)
-        }
-        (RollingHashType::RabinKarp, CryptoHashType::Blake3) => {
-            diff_core::<_, Blake3Hash>(RabinKarpHash::default(), signature, data, out)
-        }
+        (RollingHashType::RabinKarp, CryptoHashType::Md4) => diff_core(
+            RabinKarpHash::default(),
+            Md4Hash::default(),
+            signature,
+            data,
+            out,
+        ),
+        (RollingHashType::RabinKarp, CryptoHashType::Blake2) => diff_core(
+            RabinKarpHash::default(),
+            Blake2Hash::default(),
+            signature,
+            data,
+            out,
+        ),
+        (RollingHashType::RabinKarp, CryptoHashType::Blake3) => diff_core(
+            RabinKarpHash::default(),
+            Blake3Hash::default(),
+            signature,
+            data,
+            out,
+        ),
     }
 }
 
 fn diff_core<R: RollingHash<Sum = [u8; 4]>, C: CryptoHash>(
-    rolling_seed: R,
+    r_seed: R,
+    c_seed: C,
     signature: &IndexedSignature<'_>,
     data: &[u8],
     mut out: impl Write,
@@ -212,7 +225,7 @@ fn diff_core<R: RollingHash<Sum = [u8; 4]>, C: CryptoHash>(
         HashMap::with_hasher(BuildDiffuseHasher::default());
 
     while data.len() - here >= block_size {
-        let mut r_hash = rolling_seed.clone();
+        let mut r_hash = r_seed.clone();
         r_hash.update(&data[here..here + block_size]);
         loop {
             let r_sum = u32::from_be_bytes(r_hash.finish());
@@ -222,7 +235,10 @@ fn diff_core<R: RollingHash<Sum = [u8; 4]>, C: CryptoHash>(
                 .map_or(true, |&count| count < MAX_CRC_COLLISIONS)
             {
                 if let Some(blocks) = signature.blocks.get(&r_sum) {
-                    let digest = C::sum_of(&data[here..here + block_size]);
+                    let digest = c_seed
+                        .clone()
+                        .update(&data[here..here + block_size])
+                        .finish();
                     if let Some(&idx) = blocks.get(&&digest.as_ref()[..crypto_hash_size]) {
                         // match found
                         state.copy(

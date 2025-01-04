@@ -235,8 +235,8 @@ impl From<IoError> for SigCodecError {
 }
 
 pub struct SigBlockCodec<R, C> {
-    rolling: R,
-    crypto: C,
+    r_seed: R,
+    c_seed: C,
     block_size: NonZeroUsize,
     crypto_size: u32,
 }
@@ -247,8 +247,8 @@ where
     C: CryptoHash,
 {
     fn encoder_degree(&self) -> Option<usize> {
-        let r = R::degree_of_many();
-        let c = C::degree_of_many();
+        let r = self.r_seed.degree_of_many();
+        let c = self.c_seed.degree_of_many();
         r.max(c)
     }
 }
@@ -258,11 +258,11 @@ where
     R: RollingHash,
     C: CryptoHash,
 {
-    pub fn new(rolling: R, crypto: C, block_size: usize, crypto_size: u32) -> Self {
+    pub fn new(rolling_seed: R, crypto_seed: C, block_size: usize, crypto_size: u32) -> Self {
         let block_size = NonZeroUsize::new(block_size).unwrap();
         Self {
-            crypto,
-            rolling,
+            c_seed: crypto_seed,
+            r_seed: rolling_seed,
             block_size,
             crypto_size,
         }
@@ -341,8 +341,13 @@ where
         // Slice to make sure we have enough space for the loop.
         let reserved = &mut dst.spare_capacity_mut()[..additional];
 
-        let r_hashes = R::sum_of_many(chunks.clone());
-        let c_hashes = C::sum_of_many(chunks);
+        let mut r_seeds = vec![self.r_seed.clone(); chunks.len()];
+        R::update_many(r_seeds.iter_mut().zip(chunks.clone()));
+        let r_hashes = R::finish_many(r_seeds.iter());
+
+        let mut c_seeds = vec![self.c_seed.clone(); chunks.len()];
+        C::update_many(c_seeds.iter_mut().zip(chunks));
+        let c_hashes = C::finish_many(c_seeds.iter());
 
         for (i, (r_hash, c_hash)) in r_hashes.zip(c_hashes).enumerate() {
             let dst_start = i * frame_size;

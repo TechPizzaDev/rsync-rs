@@ -21,7 +21,7 @@ fn crc_update(c: &mut Criterion) {
         let data = random_block(len);
         group.throughput(Throughput::Bytes(len as u64));
         group.bench_with_input(BenchmarkId::new("Crc::sum_of", len), &data, |b, data| {
-            b.iter(|| Crc::sum_of(black_box(data)))
+            b.iter(|| Crc::default().update(black_box(data)).finish())
         });
         // TODO:
         //group.bench_with_input(
@@ -41,7 +41,7 @@ fn rabinkarp_update(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("RabinKarpHash::sum_of", len),
             &data,
-            |b, data| b.iter(|| RabinKarpHash::sum_of(black_box(data))),
+            |b, data| b.iter(|| RabinKarpHash::default().update(black_box(data)).finish()),
         );
     }
     group.finish();

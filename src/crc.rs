@@ -20,17 +20,18 @@ impl Crc {
 }
 
 impl RollingHash for Crc {
-    fn rollout(&mut self, size: usize, old_byte: u8) {
+    fn rollout(&mut self, size: usize, old_byte: u8) -> &mut Self {
         let size = size as u16;
         let old_byte = old_byte as u16;
         let (mut s1, mut s2) = self.split();
         s1 = s1.wrapping_sub(old_byte.wrapping_add(CRC_MAGIC));
         s2 = s2.wrapping_sub(size.wrapping_mul(old_byte + CRC_MAGIC));
         *self = Crc::combine(s1, s2);
+        self
     }
 
     #[inline]
-    fn rotate(&mut self, size: usize, old_byte: u8, new_byte: u8) {
+    fn rotate(&mut self, size: usize, old_byte: u8, new_byte: u8) -> &mut Self {
         let size = size as u16;
         let old_byte = old_byte as u16;
         let new_byte = new_byte as u16;
@@ -40,15 +41,17 @@ impl RollingHash for Crc {
             .wrapping_add(s1)
             .wrapping_sub(size.wrapping_mul(old_byte.wrapping_add(CRC_MAGIC)));
         *self = Crc::combine(s1, s2);
+        self
     }
 
-    fn rollin(&mut self, new_byte: u8) {
+    fn rollin(&mut self, new_byte: u8) -> &mut Self {
         let (mut s1, mut s2) = self.split();
         s1 = s1.wrapping_add(new_byte as u16);
         s2 = s2.wrapping_add(s1);
         s1 = s1.wrapping_add(CRC_MAGIC);
         s2 = s2.wrapping_add(CRC_MAGIC);
         *self = Crc::combine(s1, s2);
+        self
     }
 }
 impl SumHash for Crc {
@@ -59,9 +62,9 @@ impl SumHash for Crc {
         self.0.to_be_bytes().into()
     }
 
-    fn update(&mut self, buf: &[u8]) {
+    fn update(&mut self, buf: &[u8]) -> &mut Self {
         macro_rules! imp {
-            ($($x:tt)*) => {$($x)* (init: &mut Crc, buf: &[u8]) {
+            ($($x:tt)*) => {$($x)* <'a>(init: &'a mut Crc, buf: &[u8]) -> &'a mut Crc {
                 let (mut s1, mut s2) = init.split();
                 let len = buf.len() as u32;
                 s2 = s2.wrapping_add(s1.wrapping_mul(len as u16));
@@ -76,6 +79,7 @@ impl SumHash for Crc {
                     ((len.wrapping_mul(len.wrapping_add(1)) / 2) as u16).wrapping_mul(CRC_MAGIC),
                 );
                 *init = Crc::combine(s1, s2);
+                init
             }};
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -118,34 +122,30 @@ mod tests {
 
     #[quickcheck]
     fn rollin_one(initial: u32, buf: Vec<u8>) -> bool {
-        let mut sum1 = Crc(initial);
-        sum1.update(&buf);
-
-        let sum2 = buf.iter().copied().fold(Crc(initial), |mut s: Crc, new: u8| {
-            s.rollin(new);
-            s
-        });
+        let sum1 = Crc(initial).update(&buf).finish();
+        let sum2 = buf
+            .into_iter()
+            .fold(Crc(initial), |mut s: Crc, new: u8| {
+                s.rollin(new);
+                s
+            })
+            .finish();
         sum1 == sum2
     }
 
     #[quickcheck]
     fn optimized_update(initial: u32, buf: Vec<u8>) -> bool {
-        let mut sum1 = Crc(initial);
-        sum1.update(&buf);
-
-        let sum2 = basic_update(Crc(initial), &buf);
+        let sum1 = Crc(initial).update(&buf).finish();
+        let sum2 = basic_update(Crc(initial), &buf).finish();
         sum1 == sum2
     }
 
     #[quickcheck]
     fn update_twice(initial: u32, mut buf1: Vec<u8>, buf2: Vec<u8>) -> bool {
-        let mut sum1 = Crc(initial);
-        sum1.update(&buf1);
-        sum1.update(&buf2);
+        let sum1 = Crc(initial).update(&buf1).update(&buf2).finish();
         buf1.extend(&buf2);
 
-        let mut sum2 = Crc(initial);
-        sum2.update(&buf1);
+        let sum2 = Crc(initial).update(&buf1).finish();
         sum1 == sum2
     }
 
@@ -154,13 +154,13 @@ mod tests {
         if buf.is_empty() {
             return true;
         }
-        let mut sum1 = Crc::default();
-        sum1.update(&buf);
-        sum1.rotate(buf.len(), buf[0], byte);
+        let sum1 = Crc::default()
+            .update(&buf)
+            .rotate(buf.len(), buf[0], byte)
+            .finish();
         buf.push(byte);
 
-        let mut sum2 = Crc::default();
-        sum2.update(&buf[1..]);
+        let sum2 = Crc::default().update(&buf[1..]).finish();
         sum1 == sum2
     }
 
@@ -169,12 +169,11 @@ mod tests {
         if buf.is_empty() {
             return true;
         }
-        let mut sum1 = Crc::default();
-        sum1.update(&buf);
-        sum1.rollout(buf.len(), buf[0]);
-
-        let mut sum2 = Crc::default();
-        sum2.update(&buf[1..]);
+        let sum1 = Crc::default()
+            .update(&buf)
+            .rollout(buf.len(), buf[0])
+            .finish();
+        let sum2 = Crc::default().update(&buf[1..]).finish();
         sum1 == sum2
     }
 }

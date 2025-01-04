@@ -1,37 +1,33 @@
-use std::hash::Hash;
-
 use crate::consts::MAX_STRONG_SUM_LENGTH;
 
-pub trait SumHash: Default + Clone {
-    type Sum: Default + AsRef<[u8]>;
+pub trait SumHash: Clone {
+    type Sum: Default + AsRef<[u8]> + 'static;
 
     fn finish(&self) -> Self::Sum;
 
-    fn update(&mut self, input: &[u8]);
+    fn update(&mut self, input: &[u8]) -> &mut Self;
 
-    fn sum_of(input: &[u8]) -> Self::Sum
+    fn update_many<'a>(pairs: impl Iterator<Item = (&'a mut Self, &'a [u8])>)
     where
-        Self: Default,
+        Self: 'a,
     {
-        let mut state = Self::default();
-        state.update(input);
-        state.finish()
+        for (state, input) in pairs {
+            state.update(input);
+        }
     }
 
-    fn sum_of_many<'a>(
-        inputs: impl ExactSizeIterator<Item = &'a [u8]>,
-    ) -> impl ExactSizeIterator<Item = Self::Sum>
+    fn finish_many<'a>(states: impl Iterator<Item = &'a Self>) -> impl Iterator<Item = Self::Sum>
     where
-        Self: Default,
+        Self: 'a,
     {
-        inputs.map(|input| Self::sum_of(input))
+        states.map(|s| s.finish())
     }
 
     /// Get the maximum amount of inputs that [`sum_of_many`] can process in parallel.
     /// [`None`] means [`sum_of_many`] is not specialized.
     ///
     /// [`sum_of_many`]: SumHasher::sum_of_many
-    fn degree_of_many() -> Option<usize> {
+    fn degree_of_many(&self) -> Option<usize> {
         None
     }
 }
@@ -39,13 +35,13 @@ pub trait SumHash: Default + Clone {
 pub trait CryptoHash: SumHash {}
 
 pub trait RollingHash: SumHash {
-    fn rotate(&mut self, size: usize, old: u8, new: u8);
+    fn rotate(&mut self, size: usize, old: u8, new: u8) -> &mut Self;
 
     #[allow(dead_code)]
-    fn rollin(&mut self, new: u8);
+    fn rollin(&mut self, new: u8) -> &mut Self;
 
     #[allow(dead_code)]
-    fn rollout(&mut self, size: usize, old: u8);
+    fn rollout(&mut self, size: usize, old: u8) -> &mut Self;
 }
 
 #[derive(Default, Clone)]
@@ -58,17 +54,19 @@ impl SumHash for Md4Hash {
         self.0.finish()
     }
 
-    fn update(&mut self, input: &[u8]) {
+    fn update(&mut self, input: &[u8]) -> &mut Self {
         self.0.update(input);
+        self
     }
 
-    fn sum_of_many<'a>(
-        inputs: impl ExactSizeIterator<Item = &'a [u8]>,
-    ) -> impl ExactSizeIterator<Item = Self::Sum> {
-        crate::md4::md4_many(inputs).map(|o| o.into())
+    fn update_many<'a>(pairs: impl Iterator<Item = (&'a mut Self, &'a [u8])>)
+    where
+        Self: 'a,
+    {
+        crate::md4::md4_many(pairs.map(|s| (&mut s.0 .0, s.1)))
     }
 
-    fn degree_of_many() -> Option<usize> {
+    fn degree_of_many(&self) -> Option<usize> {
         Some(crate::md4::simd::MAX_LANES.max(1))
     }
 }
@@ -102,30 +100,16 @@ impl SumHash for Blake2Hash {
         Self::hash_to_sum(&self.0.finalize())
     }
 
-    fn update(&mut self, input: &[u8]) {
+    fn update(&mut self, input: &[u8]) -> &mut Self {
         self.0.update(input);
+        self
     }
 
-    fn sum_of(input: &[u8]) -> Self::Sum {
-        let params = Self::params();
-        Self::hash_to_sum(&params.hash(input))
+    fn update_many<'a>(pairs: impl Iterator<Item = (&'a mut Self, &'a [u8])>) {
+        blake2b_simd::many::update_many(pairs.map(|s| (&mut s.0 .0, s.1)));
     }
 
-    fn sum_of_many<'a>(
-        inputs: impl ExactSizeIterator<Item = &'a [u8]>,
-    ) -> impl ExactSizeIterator<Item = Self::Sum> {
-        let params = Self::params();
-        let mut jobs = inputs
-            .map(|input| blake2b_simd::many::HashManyJob::new(&params, input))
-            .collect::<Vec<_>>();
-
-        blake2b_simd::many::hash_many(jobs.iter_mut());
-
-        jobs.into_iter()
-            .map(|job| Self::hash_to_sum(&job.to_hash()))
-    }
-
-    fn degree_of_many() -> Option<usize> {
+    fn degree_of_many(&self) -> Option<usize> {
         Some(blake2b_simd::many::MAX_DEGREE.max(1))
     }
 }
@@ -141,8 +125,9 @@ impl SumHash for Blake3Hash {
         (*self.0.finalize().as_bytes()).into()
     }
 
-    fn update(&mut self, input: &[u8]) {
+    fn update(&mut self, input: &[u8]) -> &mut Self {
         self.0.update(input);
+        self
     }
 }
 impl CryptoHash for Blake3Hash {}
