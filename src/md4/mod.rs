@@ -25,7 +25,7 @@ macro_rules! md4 {
         splat = $splat:path,
     ) => {
         #[derive(Copy, Clone)]
-        struct Md4State {
+        pub struct Md4State {
             s: [$u32; 4],
         }
 
@@ -114,6 +114,9 @@ macro_rules! md4 {
 
 use std::convert::identity;
 use std::ops::{BitAnd, BitOr, BitXor};
+
+use crate::sum_hash::SumHash;
+
 fn andnot(x: u32, y: u32) -> u32 {
     !x & y
 }
@@ -140,32 +143,49 @@ fn load_block(input: &[u8; 64]) -> [u32; 16] {
 }
 
 pub fn md4(data: &[u8]) -> [u8; 16] {
-    let mut state = Md4State { s: S };
-    let mut chunks = data.chunks_exact(64);
-    for block in &mut chunks {
-        state.process_block(&load_block(array_ref![block, 0, 64]));
-    }
-    let remainder = chunks.remainder();
-    let mut last_blocks = [0; 128];
-    last_blocks[..remainder.len()].copy_from_slice(remainder);
-    last_blocks[remainder.len()] = 0x80;
-    let end = if remainder.len() >= 56 { 128 } else { 64 };
-    *array_mut_ref![&mut last_blocks, end - 8, 8] = (data.len() as u64 * 8).to_le_bytes();
-    let (last_block_0, last_block_1) = array_refs![&last_blocks, 64, 64];
-    state.process_block(&load_block(last_block_0));
-    if end == 128 {
-        state.process_block(&load_block(last_block_1));
-    }
-    let mut digest = [0; 16];
-    let (a, b, c, d) = mut_array_refs!(&mut digest, 4, 4, 4, 4);
-    *a = state.s[0].to_le_bytes();
-    *b = state.s[1].to_le_bytes();
-    *c = state.s[2].to_le_bytes();
-    *d = state.s[3].to_le_bytes();
-    digest
+    let mut state = Md4State::default();
+    state.update(data);
+    state.finish().into()
 }
 
-mod simd {
+impl Default for Md4State {
+    fn default() -> Self {
+        Md4State { s: S }
+    }
+}
+impl SumHash for Md4State {
+    type Sum = [u8; 16];
+
+    fn update(&mut self, data: &[u8]) {
+        let mut chunks = data.chunks_exact(64);
+        for block in &mut chunks {
+            self.process_block(&load_block(array_ref![block, 0, 64]));
+        }
+        let remainder = chunks.remainder();
+        let mut last_blocks = [0; 128];
+        last_blocks[..remainder.len()].copy_from_slice(remainder);
+        last_blocks[remainder.len()] = 0x80;
+        let end = if remainder.len() >= 56 { 128 } else { 64 };
+        *array_mut_ref![&mut last_blocks, end - 8, 8] = (data.len() as u64 * 8).to_le_bytes();
+        let (last_block_0, last_block_1) = array_refs![&last_blocks, 64, 64];
+        self.process_block(&load_block(last_block_0));
+        if end == 128 {
+            self.process_block(&load_block(last_block_1));
+        }
+    }
+
+    fn finish(&self) -> Self::Sum {
+        let mut output = [0; 16];
+        let (a, b, c, d) = mut_array_refs!(&mut output, 4, 4, 4, 4);
+        *a = self.s[0].to_le_bytes();
+        *b = self.s[1].to_le_bytes();
+        *c = self.s[2].to_le_bytes();
+        *d = self.s[3].to_le_bytes();
+        output.into()
+    }
+}
+
+pub(crate) mod simd {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub const MAX_LANES: usize = 8;
     #[cfg(any(target_arch = "aarch64"))]
@@ -175,7 +195,7 @@ mod simd {
 
     pub struct Md4xN {
         lanes: usize,
-        fun: fn(&[&[u8]]) -> [[u8; 16]; MAX_LANES],
+        fun: fn(&[&[u8]], &mut [[u8; 16]; MAX_LANES]),
     }
 
     impl Md4xN {
@@ -185,8 +205,8 @@ mod simd {
         }
 
         /// Calculate the digest of `self.lanes()` equally-sized blocks of data.
-        pub fn md4(&self, data: &[&[u8]]) -> [[u8; 16]; MAX_LANES] {
-            (self.fun)(data)
+        pub fn md4(&self, data: &[&[u8]], digests: &mut [[u8; 16]; MAX_LANES]) {
+            (self.fun)(data, digests)
         }
     }
 
@@ -238,7 +258,7 @@ mod simd {
                 /// Unsafety: This function requires $feature to be available.
                 #[allow(non_snake_case)]
                 #[target_feature(enable = $feature)]
-                unsafe fn md4xN(data: &[&[u8]; LANES]) -> [[u8; 16]; LANES] {
+                unsafe fn md4xN(data: &[&[u8]; LANES], digests: &mut [[u8; 16]; LANES]) {
                     let mut state = Md4State {
                         s: [
                             $splat(S[0]),
@@ -276,7 +296,6 @@ mod simd {
                         blocks[15] = $splat((bit_len >> 32) as u32);
                         state.process_block(&blocks);
                     }
-                    let mut digests = [[0; 16]; LANES];
                     // Safety: `u32xN` and `[u32; LANES]` are always safely transmutable
                     let final_state = mem::transmute::<[u32xN; 4], [[u32; LANES]; 4]>(state.s);
                     for lane in 0..LANES {
@@ -286,19 +305,16 @@ mod simd {
                         *c = final_state[2][lane].to_le_bytes();
                         *d = final_state[3][lane].to_le_bytes();
                     }
-                    digests
                 }
 
                 pub fn select() -> Option<Md4xN> {
                     if $feature_enabled {
                         Some(Md4xN {
                             lanes: LANES,
-                            fun: |data| {
-                                let mut ret = [[0; 16]; MAX_LANES];
-                                let (prefix, _) = mut_array_refs!(&mut ret, LANES, MAX_LANES-LANES);
+                            fun: |data, digests| {
+                                let (prefix, _) = mut_array_refs!(digests, LANES, MAX_LANES - LANES);
                                 // Safety: We just checked that $feature is available.
-                                *prefix = unsafe { md4xN(array_ref![data, 0, LANES]) };
-                                ret
+                                unsafe { md4xN(array_ref![data, 0, LANES], prefix) };
                             }
                         })
                     } else {
@@ -432,20 +448,20 @@ mod simd {
 
 pub fn md4_many<'a>(
     datas: impl ExactSizeIterator<Item = &'a [u8]>,
-) -> impl ExactSizeIterator<Item = (&'a [u8], [u8; 16])> {
-    struct SimdImpl<'a> {
+) -> impl ExactSizeIterator<Item = [u8; 16]> {
+    struct SimdImpl {
         simd_impl: simd::Md4xN,
-        buf: [(&'a [u8], [u8; 16]); simd::MAX_LANES],
+        buf: [[u8; 16]; simd::MAX_LANES],
         buf_len: usize,
     }
-    struct It<'a, I: Iterator<Item = &'a [u8]>> {
+    struct It<I> {
         len: usize,
         inner: I,
-        simd: Option<SimdImpl<'a>>,
+        simd: Option<SimdImpl>,
     }
-    impl<'a, I: Iterator<Item = &'a [u8]>> Iterator for It<'a, I> {
-        type Item = (&'a [u8], [u8; 16]);
-        #[allow(clippy::needless_range_loop)]
+    impl<'a, I: Iterator<Item = &'a [u8]>> Iterator for It<I> {
+        type Item = [u8; 16];
+
         fn next(&mut self) -> Option<Self::Item> {
             if let Some(simd) = &mut self.simd {
                 if simd.buf_len == 0 && self.len >= simd.simd_impl.lanes() {
@@ -454,11 +470,8 @@ pub fn md4_many<'a>(
                         datas[ix] = self.inner.next().unwrap();
                     }
                     self.len -= simd.simd_impl.lanes();
-                    let digests = simd.simd_impl.md4(&datas);
+                    simd.simd_impl.md4(&datas, &mut simd.buf);
                     simd.buf_len = simd.simd_impl.lanes();
-                    for lane in 0..simd.simd_impl.lanes() {
-                        simd.buf[lane] = (datas[lane], digests[lane]);
-                    }
                 }
                 if simd.buf_len > 0 {
                     let digest = simd.buf[simd.simd_impl.lanes() - simd.buf_len];
@@ -468,79 +481,96 @@ pub fn md4_many<'a>(
             }
             self.inner.next().map(|data| {
                 self.len -= 1;
-                (data, md4(data))
+                md4(data)
             })
         }
+
         fn size_hint(&self) -> (usize, Option<usize>) {
             (self.len, Some(self.len))
         }
     }
-    impl<'a, I: Iterator<Item = &'a [u8]>> ExactSizeIterator for It<'a, I> {
+    impl<'a, I: Iterator<Item = &'a [u8]>> ExactSizeIterator for It<I> {
         fn len(&self) -> usize {
             self.len
         }
     }
+
     It {
         len: datas.len(),
         inner: datas,
         simd: simd::Md4xN::select().map(|simd_impl| SimdImpl {
             simd_impl,
-            buf: [(&[] as &[_], [0; 16]); simd::MAX_LANES],
+            buf: [[0; 16]; simd::MAX_LANES],
             buf_len: 0,
         }),
     }
 }
 
-#[test]
-fn tests() {
-    let test_vectors: &[(&[u8], [u8; 16])] = &[
-        (
-            b"",
-            *b"\x31\xd6\xcf\xe0\xd1\x6a\xe9\x31\xb7\x3c\x59\xd7\xe0\xc0\x89\xc0",
-        ),
-        (
-            b"a",
-            *b"\xbd\xe5\x2c\xb3\x1d\xe3\x3e\x46\x24\x5e\x05\xfb\xdb\xd6\xfb\x24",
-        ),
-        (
-            b"abc",
-            *b"\xa4\x48\x01\x7a\xaf\x21\xd8\x52\x5f\xc1\x0a\xe8\x7a\xa6\x72\x9d",
-        ),
-        (
-            b"message digest",
-            *b"\xd9\x13\x0a\x81\x64\x54\x9f\xe8\x18\x87\x48\x06\xe1\xc7\x01\x4b",
-        ),
-        (
-            b"abcdefghijklmnopqrstuvwxyz",
-            *b"\xd7\x9e\x1c\x30\x8a\xa5\xbb\xcd\xee\xa8\xed\x63\xdf\x41\x2d\xa9",
-        ),
-        (
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
-            *b"\x04\x3f\x85\x82\xf2\x41\xdb\x35\x1c\xe6\x27\xe1\x53\xe7\xf0\xe4",
-        ),
-        (
-            b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
-            *b"\xe3\x3b\x4d\xdc\x9c\x38\xf2\x19\x9c\x3e\x7b\x16\x4f\xcc\x05\x36",
-        ),
-    ];
+#[cfg(test)]
+mod tests {
+    use crate::md4::{
+        md4,
+        simd::{self, MAX_LANES},
+    };
 
-    for &(msg, expected) in test_vectors {
-        assert_eq!(md4(msg), expected);
-        if let Some(simd_impl) = simd::Md4xN::select() {
-            assert_eq!(
-                simd_impl.md4(&vec![msg; simd_impl.lanes()])[..simd_impl.lanes()],
-                vec![expected; simd_impl.lanes()][..]
-            );
-        }
-        // make sure it also works for unaligned input
-        if msg.len() > 0 {
-            let tail = &msg[1..];
-            let tail_md4 = md4(tail);
+    #[test]
+    fn tests() {
+        let test_vectors: &[(&[u8], [u8; 16])] = &[
+            (
+                b"",
+                *b"\x31\xd6\xcf\xe0\xd1\x6a\xe9\x31\xb7\x3c\x59\xd7\xe0\xc0\x89\xc0",
+            ),
+            (
+                b"a",
+                *b"\xbd\xe5\x2c\xb3\x1d\xe3\x3e\x46\x24\x5e\x05\xfb\xdb\xd6\xfb\x24",
+            ),
+            (
+                b"abc",
+                *b"\xa4\x48\x01\x7a\xaf\x21\xd8\x52\x5f\xc1\x0a\xe8\x7a\xa6\x72\x9d",
+            ),
+            (
+                b"message digest",
+                *b"\xd9\x13\x0a\x81\x64\x54\x9f\xe8\x18\x87\x48\x06\xe1\xc7\x01\x4b",
+            ),
+            (
+                b"abcdefghijklmnopqrstuvwxyz",
+                *b"\xd7\x9e\x1c\x30\x8a\xa5\xbb\xcd\xee\xa8\xed\x63\xdf\x41\x2d\xa9",
+            ),
+            (
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                *b"\x04\x3f\x85\x82\xf2\x41\xdb\x35\x1c\xe6\x27\xe1\x53\xe7\xf0\xe4",
+            ),
+            (
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                *b"\xe3\x3b\x4d\xdc\x9c\x38\xf2\x19\x9c\x3e\x7b\x16\x4f\xcc\x05\x36",
+            ),
+        ];
+
+        for &(msg, expected) in test_vectors {
+            assert_eq!(md4(msg), expected);
+
             if let Some(simd_impl) = simd::Md4xN::select() {
+                let mut digests = [[0; 16]; MAX_LANES];
+                simd_impl.md4(&vec![msg; simd_impl.lanes()], &mut digests);
                 assert_eq!(
-                    simd_impl.md4(&vec![tail; simd_impl.lanes()])[..simd_impl.lanes()],
-                    vec![tail_md4; simd_impl.lanes()][..]
+                    digests[..simd_impl.lanes()],
+                    vec![expected; simd_impl.lanes()][..]
                 );
+            }
+
+            // make sure it also works for unaligned input
+            if msg.len() > 0 {
+                let tail = &msg[1..];
+                let tail_digest = md4(tail);
+
+                if let Some(simd_impl) = simd::Md4xN::select() {
+                    let mut digests = [[0; 16]; MAX_LANES];
+                    simd_impl.md4(&vec![tail; simd_impl.lanes()], &mut digests);
+                    assert_eq!(
+                        digests[..simd_impl.lanes()],
+                        vec![tail_digest; simd_impl.lanes()][..]
+                    );
+                }
             }
         }
     }

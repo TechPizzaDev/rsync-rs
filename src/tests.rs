@@ -1,53 +1,69 @@
 use std::io::Cursor;
 
-use crate::{apply, diff, CryptoHashType, RollingHashType, Signature, SignatureOptions};
+use crate::{apply, diff, CryptoHashType, HashType, RollingHashType, Signature, SignatureOptions};
+
+fn from_librsync_sig(sig_type: librsync::SignatureType) -> (RollingHashType, CryptoHashType) {
+    match sig_type {
+        librsync::SignatureType::MD4 => (RollingHashType::Rollsum, CryptoHashType::Md4),
+        librsync::SignatureType::Blake2 => (RollingHashType::Rollsum, CryptoHashType::Blake2),
+    }
+}
+
+/// Returns every combination of supported types.
+fn all_sig_types() -> impl Iterator<Item = (RollingHashType, CryptoHashType)> {
+    RollingHashType::iter()
+        .flat_map(|r_type| CryptoHashType::iter().map(move |c_type| (r_type, c_type)))
+}
 
 #[quickcheck_async::tokio]
 async fn test_signature_creation(data: Vec<u8>, block_size: u32, crypto_hash_size: u32) {
-    let mut sig_output = Vec::new();
-    let signature = Signature::calculate(
-        &mut &data[..],
-        &mut sig_output,
-        &SignatureOptions {
-            block_size: block_size.saturating_add(1),
-            crypto_hash_size: crypto_hash_size % 16,
-            crypto_hash: CryptoHashType::Md4,
-            rolling_hash: RollingHashType::Adler32,
-        },
-    )
-    .await
-    .unwrap();
+    for (rolling_hash, crypto_hash) in all_sig_types() {
+        let mut sig_output = Vec::new();
+        let options = SignatureOptions::new(
+            rolling_hash,
+            crypto_hash,
+            block_size.saturating_add(1),
+            crypto_hash_size % 16,
+        );
+        let signature = Signature::calculate(&mut &data[..], &mut sig_output, &options)
+            .await
+            .unwrap();
 
-    let deserialized = Signature::deserialize(&mut &sig_output[..])
-        .await
-        .expect("deserialization error");
-    assert_eq!(signature, deserialized);
+        if options.signature_type().is_some() {
+            let deserialized = Signature::deserialize(&mut &sig_output[..])
+                .await
+                .expect("deserialization error");
+            assert_eq!(signature, deserialized);
+        }
+    }
 }
 
 #[tokio::test]
 async fn test_trivial() {
     let data = vec![0; 100000];
-    let mut sig_output = Vec::new();
-    let signature = Signature::calculate(
-        &mut &data[..],
-        &mut sig_output,
-        &SignatureOptions {
-            block_size: 64,
-            crypto_hash_size: 5,
-            crypto_hash: CryptoHashType::Md4,
-            rolling_hash: RollingHashType::Adler32,
-        },
-    )
-    .await
-    .unwrap();
+    for (rolling_hash, crypto_hash) in all_sig_types() {
+        let mut sig_output = Vec::new();
+        let signature = Signature::calculate(
+            &mut &data[..],
+            &mut sig_output,
+            &SignatureOptions {
+                block_size: 64,
+                crypto_hash_size: 5,
+                crypto_hash,
+                rolling_hash,
+            },
+        )
+        .await
+        .unwrap();
 
-    let indexed = signature.index(&sig_output);
-    let mut patch = vec![];
-    diff(&indexed, &data, &mut patch).expect("diff error");
-    let mut out = vec![];
-    assert!(patch.len() < 10000);
-    apply(&data, &patch, &mut out).expect("apply error");
-    assert_eq!(data, out);
+        let indexed = signature.index(&sig_output);
+        let mut patch = vec![];
+        diff(&indexed, &data, &mut patch).expect("diff error");
+        let mut out = vec![];
+        assert!(patch.len() < 10000);
+        apply(&data, &patch, &mut out).expect("apply error");
+        assert_eq!(data, out);
+    }
 }
 
 #[tokio::test]
@@ -57,26 +73,28 @@ async fn test_delta_size() {
     data1.resize(1 << 20, 0);
     data2.resize(1 << 20, 0);
 
-    let mut sig_output = Vec::new();
-    let signature = Signature::calculate(
-        &mut &data1[..],
-        &mut sig_output,
-        &SignatureOptions {
-            block_size: 4096,
-            crypto_hash_size: 8,
-            crypto_hash: CryptoHashType::Md4,
-            rolling_hash: RollingHashType::Adler32,
-        },
-    )
-    .await
-    .unwrap();
+    for (rolling_hash, crypto_hash) in all_sig_types() {
+        let mut sig_output = Vec::new();
+        let signature = Signature::calculate(
+            &mut &data1[..],
+            &mut sig_output,
+            &SignatureOptions {
+                block_size: 4096,
+                crypto_hash_size: 8,
+                crypto_hash,
+                rolling_hash,
+            },
+        )
+        .await
+        .unwrap();
 
-    let mut patch = vec![];
-    diff(&signature.index(&sig_output), &data2, &mut patch).expect("diff error");
-    let mut out = vec![];
-    assert!(patch.len() < 10000);
-    apply(&data1, &patch, &mut out).expect("apply error");
-    assert_eq!(data2, out);
+        let mut patch = vec![];
+        diff(&signature.index(&sig_output), &data2, &mut patch).expect("diff error");
+        let mut out = vec![];
+        assert!(patch.len() < 10000);
+        apply(&data1, &patch, &mut out).expect("apply error");
+        assert_eq!(data2, out);
+    }
 }
 
 #[tokio::test]
@@ -87,78 +105,90 @@ async fn test_random() {
     let mut data = vec![0; 100000];
     rand::thread_rng().fill(&mut data[..]);
 
-    let mut sig_output = Vec::new();
-    let signature = Signature::calculate(
-        &mut &base[..],
-        &mut sig_output,
-        &SignatureOptions {
-            block_size: 4,
-            crypto_hash_size: 8,
-            crypto_hash: CryptoHashType::Md4,
-            rolling_hash: RollingHashType::Adler32,
-        },
-    )
-    .await
-    .unwrap();
+    for (rolling_hash, crypto_hash) in all_sig_types() {
+        let mut sig_output = Vec::new();
+        let signature = Signature::calculate(
+            &mut &base[..],
+            &mut sig_output,
+            &SignatureOptions {
+                block_size: 4,
+                crypto_hash_size: 8,
+                crypto_hash,
+                rolling_hash,
+            },
+        )
+        .await
+        .unwrap();
 
-    let indexed = signature.index(&sig_output);
-    let mut patch = vec![];
-    diff(&indexed, &data, &mut patch).expect("diff error");
-    let mut out = vec![];
-    apply(&base, &patch, &mut out).expect("apply error");
-    assert_eq!(data, out);
+        let indexed = signature.index(&sig_output);
+        let mut patch = vec![];
+        diff(&indexed, &data, &mut patch).expect("diff error");
+        let mut out = vec![];
+        apply(&base, &patch, &mut out).expect("apply error");
+        assert_eq!(data, out);
 
-    // interoperability: we can apply patches generated by librsync
-    let mut librsync_patch = vec![];
-    librsync::whole::delta(&mut &data[..], &mut &sig_output[..], &mut librsync_patch).unwrap();
-    out.clear();
-    apply(&base, &librsync_patch, &mut out).expect("apply error");
-    assert_eq!(data, out);
+        // interoperability: we can apply patches generated by librsync
+        let mut librsync_patch = vec![];
+        librsync::whole::delta(&mut &data[..], &mut &sig_output[..], &mut librsync_patch).unwrap();
+        out.clear();
+        apply(&base, &librsync_patch, &mut out).expect("apply error");
+        assert_eq!(data, out);
 
-    // interoperability: librsync can apply our patches
-    out.clear();
-    librsync::whole::patch(&mut Cursor::new(&base[..]), &mut &patch[..], &mut out).unwrap();
-    assert_eq!(data, out);
+        // interoperability: librsync can apply our patches
+        out.clear();
+        librsync::whole::patch(&mut Cursor::new(&base[..]), &mut &patch[..], &mut out).unwrap();
+        assert_eq!(data, out);
+    }
 }
 
 #[tokio::test]
 async fn test_signature_interoperability() {
+    // TODO: use C-bindings directly to support RabinKarp magic?
+    let librsync_types = [
+        librsync::SignatureType::MD4,
+        librsync::SignatureType::Blake2,
+    ];
+
     // interoperability: we generate identical signatures to librsync
     use rand::Rng;
-    for &block_len in &[10, 1024] {
-        for &strong_len in &[1, 8, 16] {
-            for &len in &[0, 1, 2, 10, 128, 500, 1111, 2000, 2048] {
-                let mut data = vec![0; len];
-                rand::thread_rng().fill(&mut data[..]);
-                let mut librsync_out = vec![];
-                librsync::whole::signature_with_options(
-                    &mut &data[..],
-                    &mut librsync_out,
-                    block_len,
-                    strong_len,
-                    librsync::SignatureType::MD4,
-                )
-                .unwrap();
+    for sig_type in librsync_types {
+        let (rolling_hash, crypto_hash) = from_librsync_sig(sig_type);
 
-                let mut sig_output = Vec::new();
-                Signature::calculate(
-                    &mut &data[..],
-                    &mut sig_output,
-                    &SignatureOptions {
-                        block_size: block_len as u32,
-                        crypto_hash_size: strong_len as u32,
-                        crypto_hash: CryptoHashType::Md4,
-                        rolling_hash: RollingHashType::Adler32,
-                    },
-                )
-                .await
-                .unwrap();
+        for &block_len in &[10, 1024] {
+            for &strong_len in &[1, 8, 16] {
+                for &len in &[0, 1, 2, 10, 128, 500, 1111, 2000, 2048] {
+                    let mut data = vec![0; len];
+                    rand::thread_rng().fill(&mut data[..]);
+                    let mut librsync_out = vec![];
+                    librsync::whole::signature_with_options(
+                        &mut &data[..],
+                        &mut librsync_out,
+                        block_len,
+                        strong_len,
+                        sig_type,
+                    )
+                    .unwrap();
 
-                assert_eq!(
-                    librsync_out, sig_output,
-                    "block_len={}, strong_len={}, len={}",
-                    block_len, strong_len, len
-                );
+                    let mut sig_output = Vec::new();
+                    Signature::calculate(
+                        &mut &data[..],
+                        &mut sig_output,
+                        &SignatureOptions {
+                            block_size: block_len as u32,
+                            crypto_hash_size: strong_len as u32,
+                            crypto_hash,
+                            rolling_hash,
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                    assert_eq!(
+                        librsync_out, sig_output,
+                        "block_len={}, strong_len={}, len={}",
+                        block_len, strong_len, len
+                    );
+                }
             }
         }
     }

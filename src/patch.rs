@@ -96,7 +96,7 @@ impl fmt::Display for ApplyError {
             ApplyError::TrailingData { length } => {
                 write!(f, "unexpected data after end command (len={})", length)
             }
-            Self::Io(source) => write!(f, "io error while writing the output (source={})", source),
+            Self::Io(source) => write!(f, "IO error while writing patch (source={})", source),
         }
     }
 }

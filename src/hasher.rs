@@ -1,21 +1,22 @@
-use crate::crc::Crc;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hasher};
 
-/// A very simple hasher designed for hashing `Crc`.
+/// A very simple hasher designed for diffusing weak hashes.
 #[derive(Default)]
-pub struct CrcHasher {
+pub struct DiffuseHasher {
     state: u32,
 }
 
-impl Hasher for CrcHasher {
+impl Hasher for DiffuseHasher {
     fn write(&mut self, _: &[u8]) {
         panic!("not designed for general writes");
     }
+
     #[inline]
     fn write_u32(&mut self, val: u32) {
-        assert_eq!(self.state, 0, "can't hash more than one u32");
+        debug_assert_eq!(self.state, 0, "can't hash more than one u32");
         self.state = val;
     }
+
     #[cfg(target_pointer_width = "64")]
     #[inline]
     fn finish(&self) -> u64 {
@@ -28,6 +29,7 @@ impl Hasher for CrcHasher {
         val ^= val >> 32;
         val
     }
+
     #[cfg(target_pointer_width = "32")]
     #[inline]
     fn finish(&self) -> u64 {
@@ -41,12 +43,4 @@ impl Hasher for CrcHasher {
     }
 }
 
-pub type BuildCrcHasher = BuildHasherDefault<CrcHasher>;
-
-impl Hash for Crc {
-    // This `#[inline]` is important for performance without LTO - the derived implementation doesn't always get inlined.
-    #[inline]
-    fn hash<H: Hasher>(&self, hash: &mut H) {
-        hash.write_u32(self.0);
-    }
-}
+pub type BuildDiffuseHasher = BuildHasherDefault<DiffuseHasher>;

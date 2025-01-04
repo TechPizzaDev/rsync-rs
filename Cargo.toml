@@ -1,7 +1,11 @@
 [package]
 name = "fast_rsync"
 version = "0.2.0"
-authors = ["Dropbox Engineering", "bacher09, Artyom Pavlov (RustCrypto/hashes/MD4)"]
+authors = [
+    "TechPizza",
+    "Dropbox Engineering",
+    "bacher09, Artyom Pavlov (RustCrypto/hashes/MD4)",
+]
 license = "Apache-2.0"
 description = "An optimized implementation of librsync in pure Rust."
 readme = "README.md"
@@ -9,23 +13,27 @@ repository = "https://github.com/dropbox/fast_rsync"
 keywords = ["rsync"]
 edition = "2021"
 
-exclude = [
-    ".github",
-    ".gitignore"
-]
+exclude = [".github", ".gitignore"]
 
 [dependencies]
+tokio = { version = "1.42", features = ["io-util"] }
 arrayref = "0.3"
 futures = "0.3"
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+strum = { version = "0.26", features = ["derive"] }
+
 blake2b_simd = "1.0"
+blake3 = "1.5"
 
 [dev-dependencies]
-librsync = { git = "https://github.com/goffrie/librsync-rs", rev = "e2e4b06022d889e020c439f2dc92ea2fec0e483e", default-features = false }
+librsync = { version = "0.2", default-features = false }
 quickcheck = { version = "1.0", default-features = false }
 quickcheck_macros = "1.0"
 quickcheck_async = "0.1"
 rand = "0.8"
-criterion = { version = "0.5", default-features = false, features = ["async_tokio"]}
+criterion = { version = "0.5", default-features = false, features = [
+    "async_tokio",
+] }
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [[bench]]

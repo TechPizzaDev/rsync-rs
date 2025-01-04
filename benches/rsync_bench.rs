@@ -1,13 +1,7 @@
-#[macro_use]
-extern crate criterion;
-
-#[path = "../src/crc.rs"]
-#[allow(dead_code)]
-#[allow(unused_imports)]
-mod crc;
-
-use crate::crc::Crc;
-use criterion::{black_box, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use fast_rsync::crc::Crc;
+use fast_rsync::rabinkarp::RabinKarpHash;
+use fast_rsync::sum_hash::SumHash;
 use fast_rsync::{
     apply_limited, diff, CryptoHashType, RollingHashType, Signature, SignatureOptions,
 };
@@ -22,23 +16,38 @@ fn random_block(len: usize) -> Vec<u8> {
 }
 
 fn crc_update(c: &mut Criterion) {
-    let mut group = c.benchmark_group("crc_update");
-    for &len in &[1024, 4096] {
+    let mut group = c.benchmark_group("Crc");
+    for &len in &[128, 4096] {
         let data = random_block(len);
         group.throughput(Throughput::Bytes(len as u64));
-        group.bench_with_input(BenchmarkId::new("Crc::update", len), &data, |b, data| {
-            b.iter(|| Crc::new().update(black_box(data)))
+        group.bench_with_input(BenchmarkId::new("Crc::sum_of", len), &data, |b, data| {
+            b.iter(|| Crc::sum_of(black_box(data)))
         });
+        // TODO:
+        //group.bench_with_input(
+        //    BenchmarkId::new("Crc::basic_update", len),
+        //    &data,
+        //    |b, data| b.iter(|| basic_update(Crc::default(), black_box(data))),
+        //);
+    }
+    group.finish();
+}
+
+fn rabinkarp_update(c: &mut Criterion) {
+    let mut group = c.benchmark_group("RabinKarp");
+    for &len in &[128, 4096] {
+        let data = random_block(len);
+        group.throughput(Throughput::Bytes(len as u64));
         group.bench_with_input(
-            BenchmarkId::new("Crc::basic_update", len),
+            BenchmarkId::new("RabinKarpHash::sum_of", len),
             &data,
-            |b, data| b.iter(|| Crc::new().basic_update(black_box(data))),
+            |b, data| b.iter(|| RabinKarpHash::sum_of(black_box(data))),
         );
     }
     group.finish();
 }
 
-criterion_group!(crc, crc_update);
+criterion_group!(hash, crc_update, rabinkarp_update);
 
 fn calculate_signature(c: &mut Criterion) {
     let rt = Builder::new_current_thread().build().unwrap();
@@ -59,7 +68,7 @@ fn calculate_signature(c: &mut Criterion) {
                         block_size: 4096,
                         crypto_hash_size: 8,
                         crypto_hash: CryptoHashType::Md4,
-                        rolling_hash: RollingHashType::Adler32,
+                        rolling_hash: RollingHashType::Rollsum,
                     },
                 )
                 .await
@@ -105,7 +114,7 @@ fn bench_diff(
                 block_size: 4096,
                 crypto_hash_size: 8,
                 crypto_hash: CryptoHashType::Md4,
-                rolling_hash: RollingHashType::Adler32,
+                rolling_hash: RollingHashType::Rollsum,
             },
         )
         .await
@@ -185,7 +194,7 @@ fn apply_delta(c: &mut Criterion) {
                 block_size: 4096,
                 crypto_hash_size: 8,
                 crypto_hash: CryptoHashType::Md4,
-                rolling_hash: RollingHashType::Adler32,
+                rolling_hash: RollingHashType::Rollsum,
             },
         )
         .await
@@ -222,4 +231,4 @@ fn apply_delta(c: &mut Criterion) {
 
 criterion_group!(rsync, calculate_signature, calculate_diff, apply_delta);
 
-criterion_main!(crc, rsync);
+criterion_main!(hash, rsync);

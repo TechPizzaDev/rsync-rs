@@ -8,10 +8,11 @@ use crate::consts::{
     RS_OP_LITERAL_N4, RS_OP_LITERAL_N8,
 };
 use crate::crc::Crc;
-use crate::hasher::BuildCrcHasher;
-use crate::md4::md4;
+use crate::hasher::BuildDiffuseHasher;
+use crate::rabinkarp::RabinKarpHash;
 use crate::signature::IndexedSignature;
-use crate::{CryptoHashType, RollingHashType};
+use crate::sum_hash::{Blake2Hash, Blake3Hash, CryptoHash, Md4Hash, RollingHash};
+use crate::{CryptoHashType, HashType, RollingHashType};
 
 /// This controls how many times we will allow ourselves to fail at matching a
 /// given crc before permanently giving up on it (essentially removing it from
@@ -23,6 +24,7 @@ const MAX_CRC_COLLISIONS: u32 = 1024;
 pub enum DiffError {
     /// Indicates the signature is invalid or unsupported
     InvalidSignature,
+
     /// Indicates an IO error occured when writing the delta
     Io(io::Error),
 }
@@ -31,7 +33,7 @@ impl fmt::Display for DiffError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSignature => f.write_str("invalid or unsupported signature for diff"),
-            Self::Io(source) => write!(f, "Encountered IO error when calculating diff: {}", source),
+            Self::Io(source) => write!(f, "IO error while calculating diff (source={})", source),
         }
     }
 }
@@ -164,18 +166,40 @@ impl OutputState {
 pub fn diff(
     signature: &IndexedSignature<'_>,
     data: &[u8],
+    out: impl Write,
+) -> Result<(), DiffError> {
+    match (signature.rolling_hash, signature.crypto_hash) {
+        (RollingHashType::Rollsum, CryptoHashType::Md4) => {
+            diff_core::<_, Md4Hash>(Crc::default(), signature, data, out)
+        }
+        (RollingHashType::Rollsum, CryptoHashType::Blake2) => {
+            diff_core::<_, Blake2Hash>(Crc::default(), signature, data, out)
+        }
+        (RollingHashType::Rollsum, CryptoHashType::Blake3) => {
+            diff_core::<_, Blake3Hash>(Crc::default(), signature, data, out)
+        }
+        (RollingHashType::RabinKarp, CryptoHashType::Md4) => {
+            diff_core::<_, Md4Hash>(RabinKarpHash::default(), signature, data, out)
+        }
+        (RollingHashType::RabinKarp, CryptoHashType::Blake2) => {
+            diff_core::<_, Blake2Hash>(RabinKarpHash::default(), signature, data, out)
+        }
+        (RollingHashType::RabinKarp, CryptoHashType::Blake3) => {
+            diff_core::<_, Blake3Hash>(RabinKarpHash::default(), signature, data, out)
+        }
+    }
+}
+
+fn diff_core<R: RollingHash<Sum = [u8; 4]>, C: CryptoHash>(
+    rolling_seed: R,
+    signature: &IndexedSignature<'_>,
+    data: &[u8],
     mut out: impl Write,
 ) -> Result<(), DiffError> {
-    let block_size = signature.block_size;
+    let block_size = signature.block_size as usize;
     let crypto_hash_size = signature.crypto_hash_size as usize;
     if crypto_hash_size > signature.crypto_hash.sum_len() {
         return Err(DiffError::InvalidSignature);
-    }
-
-    if (signature.crypto_hash, signature.rolling_hash)
-        != (CryptoHashType::Md4, RollingHashType::Adler32)
-    {
-        unimplemented!();
     }
 
     out.write_all(&DELTA_MAGIC.to_be_bytes())?;
@@ -184,45 +208,43 @@ pub fn diff(
         queued_copy: None,
     };
     let mut here = 0;
-    let mut collisions: HashMap<Crc, u32, BuildCrcHasher> =
-        HashMap::with_hasher(BuildCrcHasher::default());
+    let mut collisions: HashMap<u32, u32, BuildDiffuseHasher> =
+        HashMap::with_hasher(BuildDiffuseHasher::default());
 
-    while data.len() - here >= block_size as usize {
-        let mut crc = Crc::new().update(&data[here..here + block_size as usize]);
+    while data.len() - here >= block_size {
+        let mut r_hash = rolling_seed.clone();
+        r_hash.update(&data[here..here + block_size]);
         loop {
-            // if we detect too many CRC collisions, blacklist the CRC to avoid DoS
+            let r_sum = u32::from_be_bytes(r_hash.finish());
+            // if we detect too many collisions, blacklist the hash to avoid DoS
             if collisions
-                .get(&crc)
+                .get(&r_sum)
                 .map_or(true, |&count| count < MAX_CRC_COLLISIONS)
             {
-                if let Some(blocks) = signature.blocks.get(&crc) {
-                    let digest = md4(&data[here..here + block_size as usize]);
-                    if let Some(&idx) = blocks.get(&&digest[..crypto_hash_size]) {
+                if let Some(blocks) = signature.blocks.get(&r_sum) {
+                    let digest = C::sum_of(&data[here..here + block_size]);
+                    if let Some(&idx) = blocks.get(&&digest.as_ref()[..crypto_hash_size]) {
                         // match found
                         state.copy(
                             idx as u64 * block_size as u64,
-                            block_size as usize,
+                            block_size,
                             here,
                             data,
                             &mut out,
                         )?;
-                        here += block_size as usize;
+                        here += block_size;
                         break;
                     }
-                    // CRC collision
-                    *collisions.entry(crc).or_insert(0) += 1;
+                    // collision occured
+                    *collisions.entry(r_sum).or_insert(0) += 1;
                 }
             }
             // no match, try to extend
             here += 1;
-            if here + block_size as usize > data.len() {
+            if here + block_size > data.len() {
                 break;
             }
-            crc = crc.rotate(
-                block_size,
-                data[here - 1],
-                data[here + block_size as usize - 1],
-            );
+            r_hash.rotate(block_size, data[here - 1], data[here + block_size - 1]);
         }
     }
     state.emit(data.len(), data, &mut out)?;

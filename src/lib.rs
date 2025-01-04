@@ -10,18 +10,23 @@
 //!    the delta is usually much smaller than block B.
 //! 3. [apply()], which takes a block A and a delta (as constructed by [diff()]), and
 //!    (usually) returns the block B.
-#![allow(clippy::unreadable_literal)]
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 
+// TODO: reduce visibility
+
+mod codec;
 mod consts;
-mod crc;
+pub mod crc;
 mod diff;
 mod hasher;
 mod hashmap_variant;
 mod md4;
+pub mod rabinkarp;
 mod patch;
 mod signature;
+pub mod sum_hash;
 mod types;
+mod util;
 
 #[cfg(test)]
 mod tests;
@@ -31,4 +36,4 @@ pub use patch::{apply, apply_limited, ApplyError};
 pub use signature::{
     IndexedSignature, Signature, SignatureOptions, SignatureParseError, SignatureType,
 };
-pub use types::{CryptoHashType, RollingHashType};
+pub use types::{HashType, CryptoHashType, RollingHashType};
