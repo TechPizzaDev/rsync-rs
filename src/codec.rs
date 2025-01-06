@@ -6,7 +6,7 @@ use tokio_util::{
 };
 
 pub trait Codec<I, O, E>:
-    Encoder<I, Error = E> + Decoder<Item = O, Error = E>
+    Send + Encoder<I, Error = E> + Decoder<Item = O, Error = E>
 {
     fn encoder_degree(&self) -> Option<usize> {
         None
@@ -55,7 +55,7 @@ where
     }
 }
 
-impl<T, I, O, E> Codec<I, O, E> for DynCodec<T, I, O, E>
+impl<T: Send, I: Send, O: Send, E: Send> Codec<I, O, E> for DynCodec<T, I, O, E>
 where
     T: AsMut<dyn Codec<I, O, E>> + AsRef<dyn Codec<I, O, E>>,
     E: From<std::io::Error>,

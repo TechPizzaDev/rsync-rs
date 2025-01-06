@@ -243,8 +243,8 @@ pub struct SigBlockCodec<R, C> {
 
 impl<R, C> Codec<Bytes, (), SigCodecError> for SigBlockCodec<R, C>
 where
-    R: RollingHash,
-    C: CryptoHash,
+    R: Send + RollingHash,
+    C: Send + CryptoHash,
 {
     fn encoder_degree(&self) -> Option<usize> {
         let r = self.r_seed.degree_of_many();
