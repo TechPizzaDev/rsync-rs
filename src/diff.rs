@@ -224,9 +224,10 @@ fn diff_core<R: RollingHash<Sum = [u8; 4]>, C: CryptoHash>(
     let mut collisions: HashMap<u32, u32, BuildDiffuseHasher> =
         HashMap::with_hasher(BuildDiffuseHasher::default());
 
-    while data.len() - here >= block_size {
+    while data.len() - here > 0 {
+        let block_len = block_size.min(data.len() - here);
         let mut r_hash = r_seed.clone();
-        r_hash.update(&data[here..here + block_size]);
+        r_hash.update(&data[here..here + block_len]);
         loop {
             let r_sum = u32::from_be_bytes(r_hash.finish());
             // if we detect too many collisions, blacklist the hash to avoid DoS
@@ -237,18 +238,18 @@ fn diff_core<R: RollingHash<Sum = [u8; 4]>, C: CryptoHash>(
                 if let Some(blocks) = signature.blocks.get(&r_sum) {
                     let digest = c_seed
                         .clone()
-                        .update(&data[here..here + block_size])
+                        .update(&data[here..here + block_len])
                         .finish();
                     if let Some(&idx) = blocks.get(&&digest.as_ref()[..crypto_hash_size]) {
                         // match found
                         state.copy(
                             idx as u64 * block_size as u64,
-                            block_size,
+                            block_len,
                             here,
                             data,
                             &mut out,
                         )?;
-                        here += block_size;
+                        here += block_len;
                         break;
                     }
                     // collision occured
@@ -257,10 +258,10 @@ fn diff_core<R: RollingHash<Sum = [u8; 4]>, C: CryptoHash>(
             }
             // no match, try to extend
             here += 1;
-            if here + block_size > data.len() {
+            if here + block_len > data.len() {
                 break;
             }
-            r_hash.rotate(block_size, data[here - 1], data[here + block_size - 1]);
+            r_hash.rotate(block_len, data[here - 1], data[here + block_len - 1]);
         }
     }
     state.emit(data.len(), data, &mut out)?;
